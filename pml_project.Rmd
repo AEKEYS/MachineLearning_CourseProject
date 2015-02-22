@@ -1,0 +1,221 @@
+---
+title: "Better Weight Lifting Through Machine Learning"
+author: "AEKEYS"
+date: "February 21, 2015"
+output: html_document
+---
+
+***Synopsis:*** This paper describes the process for building a classification model that predicts the quality of Unilateral Dumbbell Biceps Curls based on an exerciser's motion sensor output. Data were obtained from Velloso, et al's study, ["Qualitative Activity Recognition of Weight Lifting Exercises"](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). This paper was an assignment for the Johns Hopkins University's ["Practical Machine Learning"](https://www.coursera.org/course/predmachlearn) offered through Coursera.
+
+###Objective
+The model's objective is to correctly classify an exerciser's motion into one of five classes based on the output of 12 motion sensors (accelerometer, gyroscope, and
+magnetometer readings in the glove, arm, belt, and dumbbell). In this way, the model helps the exerciser determine whether he or she is correctly performing the Dumbbell Bicep Curl.
+
+The five possible classifications are:
+
+*   (Class A) Exactly according to the specification,  
+*   (Class B) Throwing the elbows to the front,  
+*   (Class C) Lifting the dumbbell only halfway,  
+*   (Class D) Lowering the dumbbell only halfway,  
+*   (Class E) Throwing the hips to the front.
+
+```{r echo=FALSE, results='hide', message=FALSE}
+library(caret)
+TrainingUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+TestUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+getData <- function(file, url) {
+    # Gets file from web and unzips it into working directory
+    found <- F
+    if (file %in% dir()) {
+        found <- T
+    }
+    if (!found) {
+        download.file(url, file, method = "curl")
+    }
+}
+getData("pml-testing.csv", TestingUrl)
+```
+
+###Step 1: Load the data
+
+The data are loaded from CSV from a URL provided by Coursera. Missing, blank, or undefined data are coded as NA.
+
+```{r cache=TRUE}
+getData("pml-training.csv", TrainingUrl)
+WLE <- read.csv("pml-training.csv",
+                header=TRUE,
+                stringsAsFactors=FALSE,
+                na.strings = c(""," ", "NA", "#DIV/0!"))
+```
+
+###Step 2: Clean the data
+
+Data not relevant to the objective are identified and either reformatted or removed.
+
+```{r echo=FALSE,results='hide'}
+fishyColumns <- names(WLE)[which(sapply(WLE,class)=="logical")] #something weird here
+
+for (i in 1:length(fishyColumns)){
+    print(summary(WLE[,fishyColumns[i]])) #all are NAs
+}
+
+colToRemove <- which(names(WLE) %in% fishyColumns)
+
+WLE <- WLE[,-c(colToRemove)] #remove features with all NAs
+```
+*  Upon inspection, `r length(fishyColumns)` sensors ("variables") output no information whatsoever. These are removed.  
+*  Identifier variables in the data (e.g. observation labels, timing windows) will not be available in real-world applications, so they are removed. Timestamps are also removed, since data are already ordered sequentially.
+*  Sensors that did not record activity during certain time periods are recoded from NA to 0. Sensors that recorded near zero variablilty are also discarded, since they represent no information about the activity being performed.
+
+```{r echo=FALSE, results='hide'}
+WLE <- transform(WLE, classe = factor(classe)) #outcome label
+WLE <- transform(WLE, user_name = factor(user_name)) #subject name
+WLE <- WLE[,-c(1,3:7)] #identifier variables that won't be available in real-world application, data is already ordered sequentially
+WLE[,-c(1,148)] <- lapply(WLE[,-c(1, 148)],as.numeric) #make all others numeric
+```
+
+```{r cache=TRUE}
+WLE[is.na(WLE)] <- 0 #replace NAs with 0 (the device does not measure any activity)
+nzv <- nearZeroVar(WLE, saveMetrics = TRUE)
+WLE <- WLE[,-c(which(names(WLE) %in% rownames(nzv)[nzv$nzv==TRUE]))] #remove nzv columns
+```
+
+###Step 3: Create training, validation, and test sets
+
+* A ***training*** set is created from ~50% of the data for use in model training.
+* A ***validation*** set is created from ~20% for use in model tuning and selection.
+* A ***testing*** set (~30% of the data) is held in reserve as an unbiased estimator for out of sample error.
+```{r echo=FALSE, results='hide', cache=TRUE}
+set.seed(3223)
+inTrain <- createDataPartition(y = WLE$classe,
+                               p = .7,
+                               list = FALSE)
+
+training <- WLE[inTrain,] # use this for training and cross validation
+independentTest <- WLE[-inTrain,] # reserve for independent test to estimate out of sample error
+
+inTrain <- createDataPartition(y=training$classe,
+                               p = .7,
+                               list = FALSE)
+
+training <- training[inTrain,] #use soley for training
+validation <- training[-inTrain,] #use for cross validation, model tuning
+```
+
+###Step 4: Explore data
+
+Read in data from one subject to get a better sense of how data are organized. The chart below depicts four different sensor measures for user Carlitos. 
+
+ *   Carlitos' activity in the training set is appears to be about for ~1.5 minutes of activity (1531 readings), meaning that each observation is .000964 of a minute or ~.05 seconds (50 would be about 2.5 seconds).  
+ *   Carlitos performed the exercise in five different ways (A, B, C, D, E) sequentially.
+
+```{r echo=FALSE}
+carlitos <- subset(training, user_name=="carlitos")
+par(mfrow=c(2,2))
+plot(carlitos[,c("roll_belt")], col=carlitos$classe, ylab="roll_belt")
+plot(carlitos[,c("pitch_forearm")], col=carlitos$classe, ylab="pitch_forearm")
+plot(carlitos[,c("magnet_dumbbell_y")], col=carlitos$classe, ylab="magnet_dumbbell_y")
+plot(carlitos[,c("roll_forearm")], col=carlitos$classe, ylab="roll_forearm")
+legend("bottomright", legend=unique(carlitos$classe), col=unique(carlitos$classe), pch=1)
+mtext("Carlitos' Activity", side = 3, line = -3, outer = TRUE)
+par(mfrow=c(1,1))
+```
+
+###Step 5: Feature selection
+
+To select the motion sensor readings (the variables or "features") that will be used to train the model, I begin by running a random forest model to let the data help select important features. Here, "importance" is defined as how well a particular variable partitions the data into the defined classes. The measure used is a mean decrease in Gini (where Gini is defined as "inequity" or "node impurity" in the tree classification).  
+
+```{r cache=TRUE, message=FALSE}
+# Random Forest Approach --> let the data help us select the features to use
+set.seed(6432)
+require(randomForest)
+modFitRF <- randomForest(classe ~ . , 
+                         strata = user_name,
+                         data=training, importance=TRUE,
+                        proximity=TRUE)
+importantVar <- round(importance(modFitRF),2)
+importantVar <- importantVar[order(importantVar[,7], decreasing = TRUE),]
+###RF model
+predRF <- predict(modFitRF, validation)
+RFConfusionMat <- confusionMatrix(predRF, validation$classe)
+```
+
+I then use the ordered list of important variables to see how many should be included in a decision tree calculation. I base the decision on the accuracy of the model on a validation set, which is separate from the training set and, thus, helps estimate the out of sample error.
+
+```{r echo=FALSE,results='hide',cache=TRUE}
+scores <- as.numeric(rep(0,times=20))
+
+for (i in 1:length(scores)){
+    
+    fmla <- as.formula(paste("classe ~ ", paste(rownames(importantVar)[1:i], collapse= "+")))
+    
+    modFitTree <- train(fmla, 
+                        method = "rpart",
+                        data=training)
+    pTree <- predict(modFitTree, validation)
+    confMat <- confusionMatrix(pTree, validation$classe)
+    scores[i] <- confMat$overall[[1]]
+}
+```
+
+  *  The five variables with the highest mean decrease in Gini appear to be the optimal model for a single decision tree classification. Including additional variables past this points represents no gain to accuracy on the cross validation set.
+  
+```{r}
+plot(1:length(scores),scores, type="l",lwd=2, col="blue", 
+     main="Tree Cross Validation Performance by No. Leafs",
+     xlab="No. of included variables (ordered by MeanDecreaseGini)",
+     ylab="Overall Accuracy")
+```
+
+  *  However, the out of sample error is still too high, as indicated by the relatively low accuracy rate and numerous misclassifications.  The confusion matrix and decision tree for the five variables would look as follows: 
+  
+```{r echo=FALSE, results='hide'}
+fmla <- as.formula(paste("classe ~ ", paste(rownames(importantVar)[1:5], collapse= "+")))
+
+modFitTree <- train(fmla, 
+                    method = "rpart",
+                    data=training)
+pTree <- predict(modFitTree, validation)
+confMat <- confusionMatrix(pTree, validation$classe)
+```
+
+```{r echo=FALSE,message=FALSE}
+library(rattle)
+confMat$table
+fancyRpartPlot(modFitTree$finalModel) #best model for simple tree
+```
+
+###Step 6: Model selection
+
+In addition to the simple decision tree described above, I also tried linear discriminant and naive Bayes models. None of these performed as well on the validation set as the random trees model.  Therefore, the random trees model was selected as the optimal model.
+
+```{r echo=FALSE,results='hide',message=FALSE,warning=FALSE,include=FALSE}
+###LDS model
+modFitLDA <- train(classe ~ . -user_name,
+                   data = training,
+                   method = "lda")
+pLDA <- predict(modFitLDA, validation)
+LDAConfusionMat <- confusionMatrix(pLDA, validation$classe)
+
+###NB model
+modFitNB <- train(classe ~ roll_belt + magnet_dumbbell_z + pitch_forearm,
+                  data = training,
+                  method = "nb")
+pNB <- predict(modFitNB, validation)
+NBConfusionMat <- confusionMatrix(pNB, validation$classe) #appears to suffer from underrun
+```
+
+ *  5 variable tree accuracy: `r confMat$overall[1]`
+ *  LDA accuracy: `r LDAConfusionMat$overall[1]`
+ *  NB accuracy: `r NBConfusionMat$overall[1]`
+ *  ***Random forest accuracy: `r RFConfusionMat$overall[1]`***
+ 
+###Final Step: Checking accuracy on independent test set
+
+I check the accuracy on an independent test set to estimate the out of sample error.  The model performs exceedingly well.
+
+```{r}
+finalTest <- predict(modFitRF, independentTest)
+confusionMatrix(finalTest, independentTest$classe)
+```
