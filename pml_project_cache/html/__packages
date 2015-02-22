@@ -4,3 +4,6 @@ ggplot2
 caret
 randomForest
 rpart
+rattle
+MASS
+klaR
